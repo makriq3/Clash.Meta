@@ -15,6 +15,7 @@ import (
 
 	"github.com/metacubex/mihomo/component/loopback"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/log"
 	"github.com/metacubex/mihomo/transport/byedpi"
 )
 
@@ -172,9 +173,11 @@ func validateByeByeDPIArgs(args []string) error {
 			return fmt.Errorf("byebyedpi listener option %q is not allowed", arg)
 		case strings.HasPrefix(arg, "--ip=") || strings.HasPrefix(arg, "--port="):
 			return fmt.Errorf("byebyedpi listener option %q is not allowed", arg)
+		case arg == "-P" || arg == "--protect-path" || strings.HasPrefix(arg, "-P") || strings.HasPrefix(arg, "--protect-path="):
+			return fmt.Errorf("byebyedpi protect option %q is managed by Android core", arg)
 		case arg == "-D" || arg == "--daemon" || arg == "-w" || arg == "--pidfile" || arg == "-E" || arg == "--transparent":
 			return fmt.Errorf("byebyedpi process/listener option %q is not allowed", arg)
-		case (arg == "-I" || arg == "--conn-ip" || arg == "-P" || arg == "--protect-path") && i == len(args)-1:
+		case (arg == "-I" || arg == "--conn-ip") && i == len(args)-1:
 			return fmt.Errorf("byebyedpi option %q requires a value", arg)
 		}
 	}
@@ -209,10 +212,12 @@ func (b *ByeByeDPI) DialContext(ctx context.Context, metadata *C.Metadata) (C.Co
 	}
 	backend, err := b.ensureBackend()
 	if err != nil {
+		log.Warnln("[ByeByeDPI] %s backend start failed: %v", b.Name(), err)
 		return nil, err
 	}
 	c, err := (&net.Dialer{}).DialContext(ctx, "tcp", backend.Addr())
 	if err != nil {
+		log.Warnln("[ByeByeDPI] %s backend dial failed: %v", b.Name(), err)
 		return nil, err
 	}
 	defer func() {
@@ -221,6 +226,7 @@ func (b *ByeByeDPI) DialContext(ctx context.Context, metadata *C.Metadata) (C.Co
 		}
 	}()
 	if _, err = b.socksBackend(backend.Addr()).StreamConnContext(ctx, c, metadata); err != nil {
+		log.Warnln("[ByeByeDPI] %s SOCKS relay failed: %v", b.Name(), err)
 		return nil, err
 	}
 	return b.loopBack.NewConn(NewConn(c, b)), nil
@@ -380,6 +386,7 @@ func (b *ByeByeDPI) ensureBackend() (*byedpi.Instance, error) {
 		return nil, err
 	}
 	b.backend = backend
+	log.Infoln("[ByeByeDPI] %s backend started", b.Name())
 	return backend, nil
 }
 

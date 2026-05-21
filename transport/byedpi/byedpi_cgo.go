@@ -62,10 +62,13 @@ import (
 	"errors"
 	"net"
 	"os"
+	"runtime"
 	"strconv"
 	"sync"
 	"time"
 	"unsafe"
+
+	"github.com/metacubex/mihomo/log"
 )
 
 var (
@@ -89,10 +92,15 @@ func Start(args []string) (*Instance, error) {
 		return nil, err
 	}
 	fullArgs := []string{"ciadpi", "--ip", "127.0.0.1", "--port", strconv.Itoa(port)}
-	if protectPath := os.Getenv("BBDPI_PROTECT_PATH"); protectPath != "" {
+	protectPath := os.Getenv("BBDPI_PROTECT_PATH")
+	if protectPath == "" && runtime.GOOS == "android" {
+		return nil, errors.New("byedpi protect path is not configured")
+	}
+	if protectPath != "" {
 		fullArgs = append(fullArgs, "--protect-path", protectPath)
 	}
 	fullArgs = append(fullArgs, args...)
+	log.Infoln("[ByeByeDPI] starting native backend at %s, protect=%v, args=%d", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), protectPath != "", len(args))
 
 	argc := C.int(len(fullArgs))
 	argv := make([]*C.char, len(fullArgs))
@@ -106,6 +114,11 @@ func Start(args []string) (*Instance, error) {
 		for _, arg := range argv {
 			C.free(unsafe.Pointer(arg))
 		}
+		if code != 0 {
+			log.Warnln("[ByeByeDPI] native backend exited with code %d", code)
+		} else {
+			log.Infoln("[ByeByeDPI] native backend stopped")
+		}
 		runMu.Lock()
 		running = false
 		runMu.Unlock()
@@ -115,8 +128,10 @@ func Start(args []string) (*Instance, error) {
 	inst := &Instance{addr: net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), done: done}
 	if err := inst.waitReady(2 * time.Second); err != nil {
 		inst.Close()
+		log.Warnln("[ByeByeDPI] native backend did not become ready: %v", err)
 		return nil, err
 	}
+	log.Infoln("[ByeByeDPI] native backend ready at %s", inst.addr)
 	return inst, nil
 }
 

@@ -27,3 +27,20 @@ func TestByeByeDPISocksBackendKeepsProxyIdentity(t *testing.T) {
 		t.Fatal("UDP support should be preserved")
 	}
 }
+
+func TestByeByeDPIRejectsUserProtectPath(t *testing.T) {
+	for _, args := range [][]string{
+		{"-P", "/tmp/byedpi.sock"},
+		{"-P/tmp/byedpi.sock"},
+		{"--protect-path", "/tmp/byedpi.sock"},
+		{"--protect-path=/tmp/byedpi.sock"},
+	} {
+		if _, err := NewByeByeDPI(ByeByeDPIOption{
+			Name:     "BBDPI",
+			Strategy: "fixed",
+			Args:     args,
+		}); err == nil {
+			t.Fatalf("expected protect path rejection for args %v", args)
+		}
+	}
+}
