@@ -7,15 +7,15 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/loopback"
-	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/transport/byedpi"
 )
 
 const (
@@ -48,6 +48,9 @@ type ByeByeDPI struct {
 
 	benchmarkOnce sync.Once
 	benchmarkErr  error
+
+	backendMu sync.Mutex
+	backend   *byedpi.Instance
 }
 
 type ByeByeDPIOption struct {
@@ -72,85 +75,6 @@ type ByeByeDPIAutoOption struct {
 	Timeout     int      `proxy:"timeout,omitempty"`
 	Requests    int      `proxy:"requests,omitempty"`
 	Concurrency int      `proxy:"concurrency,omitempty"`
-}
-
-type byeByeDPIDesyncPlan struct {
-	splits []int
-}
-
-type byeByeDPIConn struct {
-	net.Conn
-	once sync.Once
-	plan byeByeDPIDesyncPlan
-	err  error
-}
-
-func (c *byeByeDPIConn) Write(b []byte) (int, error) {
-	if len(b) == 0 {
-		return c.Conn.Write(b)
-	}
-	usedPlan := false
-	c.once.Do(func() {
-		usedPlan = true
-		c.err = c.writeWithPlan(b)
-	})
-	if usedPlan {
-		if c.err != nil {
-			return 0, c.err
-		}
-		return len(b), nil
-	}
-	return c.Conn.Write(b)
-}
-
-func (c *byeByeDPIConn) writeWithPlan(b []byte) error {
-	splits := normalizeSplitPositions(c.plan.splits, len(b))
-	if len(splits) == 0 {
-		_, err := c.Conn.Write(b)
-		return err
-	}
-	start := 0
-	for _, split := range splits {
-		if split <= start || split >= len(b) {
-			continue
-		}
-		if _, err := c.Conn.Write(b[start:split]); err != nil {
-			return err
-		}
-		start = split
-	}
-	if start < len(b) {
-		_, err := c.Conn.Write(b[start:])
-		return err
-	}
-	return nil
-}
-
-func normalizeSplitPositions(positions []int, size int) []int {
-	if size <= 1 {
-		return nil
-	}
-	seen := map[int]struct{}{}
-	out := make([]int, 0, len(positions))
-	for _, pos := range positions {
-		if pos < 0 {
-			pos = size + pos
-		}
-		if pos <= 0 || pos >= size {
-			continue
-		}
-		if _, ok := seen[pos]; ok {
-			continue
-		}
-		seen[pos] = struct{}{}
-		out = append(out, pos)
-	}
-	for i := 1; i < len(out); i++ {
-		for j := i; j > 0 && out[j-1] > out[j]; j-- {
-			out[j-1], out[j] = out[j], out[j-1]
-		}
-	}
-	return out
 }
 
 func NewByeByeDPI(option ByeByeDPIOption) (*ByeByeDPI, error) {
@@ -283,20 +207,23 @@ func (b *ByeByeDPI) DialContext(ctx context.Context, metadata *C.Metadata) (C.Co
 	if err := b.ensureSelectedStrategy(ctx); err != nil {
 		return nil, err
 	}
-	c, err := b.dialTCP(ctx, metadata.RemoteAddress())
+	backend, err := b.ensureBackend()
 	if err != nil {
 		return nil, err
 	}
-	plan := parseByeByeDPIPlan(b.selectedArgs())
-	return b.loopBack.NewConn(NewConn(&byeByeDPIConn{Conn: c, plan: plan}, b)), nil
-}
-
-func (b *ByeByeDPI) dialTCP(ctx context.Context, address string) (net.Conn, error) {
-	if b.option.DialerProxy != "" || b.option.DialerForAPI != nil {
-		return b.dialer.DialContext(ctx, "tcp", address)
+	c, err := (&net.Dialer{}).DialContext(ctx, "tcp", backend.Addr())
+	if err != nil {
+		return nil, err
 	}
-	opts := append(b.DialOptions(), dialer.WithResolver(resolver.DirectHostResolver))
-	return dialer.DialContext(ctx, "tcp", address, opts...)
+	defer func() {
+		if err != nil {
+			_ = c.Close()
+		}
+	}()
+	if _, err = b.socksBackend(backend.Addr()).StreamConnContext(ctx, c, metadata); err != nil {
+		return nil, err
+	}
+	return b.loopBack.NewConn(NewConn(c, b)), nil
 }
 
 func (b *ByeByeDPI) ensureSelectedStrategy(ctx context.Context) error {
@@ -365,11 +292,29 @@ func (b *ByeByeDPI) checkSite(ctx context.Context, site string, args []string, t
 		ResponseHeaderTimeout: timeout,
 		TLSHandshakeTimeout:   timeout,
 		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
-			c, err := b.dialTCP(ctx, address)
+			backend, err := byedpi.Start(args)
 			if err != nil {
 				return nil, err
 			}
-			return &byeByeDPIConn{Conn: c, plan: parseByeByeDPIPlan(args)}, nil
+			c, err := (&net.Dialer{}).DialContext(ctx, "tcp", backend.Addr())
+			if err != nil {
+				_ = backend.Close()
+				return nil, err
+			}
+			host, port, err := net.SplitHostPort(address)
+			if err != nil {
+				_ = backend.Close()
+				_ = c.Close()
+				return nil, err
+			}
+			p, _ := strconv.Atoi(port)
+			metadata := &C.Metadata{Host: host, DstPort: uint16(p)}
+			if _, err = b.socksBackend(backend.Addr()).StreamConnContext(ctx, c, metadata); err != nil {
+				_ = backend.Close()
+				_ = c.Close()
+				return nil, err
+			}
+			return closeWithBackendConn{Conn: c, backend: backend}, nil
 		},
 	}
 	defer transport.CloseIdleConnections()
@@ -398,26 +343,11 @@ func (b *ByeByeDPI) ListenPacketContext(ctx context.Context, metadata *C.Metadat
 	if err := b.loopBack.CheckPacketConn(metadata); err != nil {
 		return nil, err
 	}
-	if err := b.ResolveUDP(ctx, metadata); err != nil {
-		return nil, err
-	}
-	opts := append(b.DialOptions(), dialer.WithResolver(resolver.DirectHostResolver))
-	pc, err := dialer.NewDialer(opts...).ListenPacket(ctx, "udp", "", metadata.AddrPort())
+	backend, err := b.ensureBackend()
 	if err != nil {
 		return nil, err
 	}
-	return b.loopBack.NewPacketConn(newPacketConn(pc, b)), nil
-}
-
-func (b *ByeByeDPI) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {
-	if (!metadata.Resolved() || resolver.DirectHostResolver != resolver.DefaultResolver) && metadata.Host != "" {
-		ip, err := resolver.ResolveIPWithResolver(ctx, metadata.Host, resolver.DirectHostResolver)
-		if err != nil {
-			return fmt.Errorf("can't resolve ip: %w", err)
-		}
-		metadata.DstIP = ip
-	}
-	return nil
+	return b.socksBackend(backend.Addr()).ListenPacketContext(ctx, metadata)
 }
 
 func (b *ByeByeDPI) IsL3Protocol(metadata *C.Metadata) bool {
@@ -439,65 +369,66 @@ func (b *ByeByeDPI) MarshalJSON() ([]byte, error) {
 	})
 }
 
-func parseByeByeDPIPlan(args []string) byeByeDPIDesyncPlan {
-	plan := byeByeDPIDesyncPlan{}
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		var value string
-		switch {
-		case arg == "-s" || arg == "--split" ||
-			arg == "-d" || arg == "--disorder" ||
-			arg == "-o" || arg == "--oob" ||
-			arg == "-q" || arg == "--disoob" ||
-			arg == "-r" || arg == "--tlsrec":
-			if i+1 >= len(args) {
-				continue
-			}
-			i++
-			value = args[i]
-		case strings.HasPrefix(arg, "-s") && len(arg) > 2:
-			value = arg[2:]
-		case strings.HasPrefix(arg, "--split="):
-			value = strings.TrimPrefix(arg, "--split=")
-		case strings.HasPrefix(arg, "-d") && len(arg) > 2:
-			value = arg[2:]
-		case strings.HasPrefix(arg, "--disorder="):
-			value = strings.TrimPrefix(arg, "--disorder=")
-		case strings.HasPrefix(arg, "-o") && len(arg) > 2:
-			value = arg[2:]
-		case strings.HasPrefix(arg, "--oob="):
-			value = strings.TrimPrefix(arg, "--oob=")
-		case strings.HasPrefix(arg, "-q") && len(arg) > 2:
-			value = arg[2:]
-		case strings.HasPrefix(arg, "--disoob="):
-			value = strings.TrimPrefix(arg, "--disoob=")
-		case strings.HasPrefix(arg, "-r") && len(arg) > 2:
-			value = arg[2:]
-		case strings.HasPrefix(arg, "--tlsrec="):
-			value = strings.TrimPrefix(arg, "--tlsrec=")
-		default:
-			continue
-		}
-		if pos, ok := parseByeByeDPIPosition(value); ok {
-			plan.splits = append(plan.splits, pos)
-		}
+func (b *ByeByeDPI) ensureBackend() (*byedpi.Instance, error) {
+	b.backendMu.Lock()
+	defer b.backendMu.Unlock()
+	if b.backend != nil {
+		return b.backend, nil
 	}
-	return plan
+	backend, err := byedpi.Start(b.selectedArgs())
+	if err != nil {
+		return nil, err
+	}
+	b.backend = backend
+	return backend, nil
 }
 
-func parseByeByeDPIPosition(value string) (int, bool) {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return 0, false
+func (b *ByeByeDPI) socksBackend(addr string) *Socks5 {
+	return &Socks5{
+		Base: &Base{
+			name:   b.Name(),
+			addr:   addr,
+			tp:     C.ByeByeDPI,
+			pdName: b.ProxyInfo().ProviderName,
+			udp:    b.option.UDP,
+			dialer: localByeByeDPIDialer{},
+		},
+		option: &Socks5Option{Name: b.Name(), Server: "127.0.0.1", UDP: b.option.UDP},
 	}
-	for _, sep := range []string{"+", ":", ","} {
-		if idx := strings.Index(value, sep); idx >= 0 {
-			value = value[:idx]
+}
+
+func (b *ByeByeDPI) Close() error {
+	b.backendMu.Lock()
+	defer b.backendMu.Unlock()
+	if b.backend != nil {
+		err := b.backend.Close()
+		b.backend = nil
+		return err
+	}
+	return nil
+}
+
+type closeWithBackendConn struct {
+	net.Conn
+	backend *byedpi.Instance
+}
+
+func (c closeWithBackendConn) Close() error {
+	err := c.Conn.Close()
+	if c.backend != nil {
+		if backendErr := c.backend.Close(); err == nil {
+			err = backendErr
 		}
 	}
-	pos, err := strconv.Atoi(value)
-	if err != nil || pos == 0 {
-		return 0, false
-	}
-	return pos, true
+	return err
+}
+
+type localByeByeDPIDialer struct{}
+
+func (localByeByeDPIDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	return (&net.Dialer{}).DialContext(ctx, network, address)
+}
+
+func (localByeByeDPIDialer) ListenPacket(ctx context.Context, network, address string, rAddrPort netip.AddrPort) (net.PacketConn, error) {
+	return (&net.ListenConfig{}).ListenPacket(ctx, network, address)
 }
