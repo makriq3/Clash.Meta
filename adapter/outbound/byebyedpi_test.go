@@ -15,20 +15,45 @@ func TestByeByeDPISocksBackendKeepsProxyIdentity(t *testing.T) {
 		Name:     "BBDPI",
 		Strategy: "fixed",
 		Args:     []string{"-d1", "-S", "-a1"},
-		UDP:      true,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	backend := proxy.socksBackend("127.0.0.1:12345")
+	backend := proxy.socksBackend("unix", "/tmp/byedpi.sock")
 	if backend.Type() != C.ByeByeDPI {
 		t.Fatalf("unexpected backend type: %s", backend.Type())
 	}
 	if backend.Name() != "BBDPI" {
 		t.Fatalf("unexpected backend name: %s", backend.Name())
 	}
-	if !backend.SupportUDP() {
-		t.Fatal("UDP support should be preserved")
+	if backend.SupportUDP() {
+		t.Fatal("UDP support should stay disabled for private socket backend")
+	}
+}
+
+func TestByeByeDPIRejectsUDP(t *testing.T) {
+	_, err := NewByeByeDPI(ByeByeDPIOption{
+		Name:     "BBDPI",
+		Strategy: "fixed",
+		Args:     []string{"-d1"},
+		UDP:      true,
+	})
+	if err == nil {
+		t.Fatal("expected udp=true to be rejected")
+	}
+}
+
+func TestByeByeDPIListenPacketIsNotSupported(t *testing.T) {
+	proxy, err := NewByeByeDPI(ByeByeDPIOption{
+		Name:     "BBDPI",
+		Strategy: "fixed",
+		Args:     []string{"-d1"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := proxy.ListenPacketContext(context.Background(), &C.Metadata{}); err != C.ErrNotSupport {
+		t.Fatalf("expected ErrNotSupport, got %v", err)
 	}
 }
 
@@ -38,6 +63,8 @@ func TestByeByeDPIRejectsUserProtectPath(t *testing.T) {
 		{"-P/tmp/byedpi.sock"},
 		{"--protect-path", "/tmp/byedpi.sock"},
 		{"--protect-path=/tmp/byedpi.sock"},
+		{"--unix-socket", "/tmp/byedpi.sock"},
+		{"--unix-socket=/tmp/byedpi.sock"},
 	} {
 		if _, err := NewByeByeDPI(ByeByeDPIOption{
 			Name:     "BBDPI",
@@ -131,7 +158,7 @@ func TestByeByeDPIDialContextRelaysDomainTCP(t *testing.T) {
 	proxy, err := NewByeByeDPI(ByeByeDPIOption{
 		Name:     "BBDPI",
 		Strategy: "fixed",
-		Args:     []string{"-Ku", "-a1", "-An", "-o1", "-At,r,s", "-d1"},
+		Args:     []string{"-Ku", "-a1", "-An", "-o1", "-At,r,s", "-d1", "-X"},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -142,7 +169,7 @@ func TestByeByeDPIDialContextRelaysDomainTCP(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	conn, err := proxy.DialContext(ctx, &C.Metadata{
-		Host:    "127.0.0.1",
+		Host:    "localhost",
 		DstPort: uint16(addr.Port),
 	})
 	if err != nil {

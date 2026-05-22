@@ -13,6 +13,7 @@
     #include <netinet/in.h>
     #include <unistd.h>
     #include <sys/socket.h>
+    #include <sys/un.h>
 #endif
 
 #include "mpool.h"
@@ -76,6 +77,9 @@ union sockaddr_u {
     struct sockaddr sa;
     struct sockaddr_in in;
     struct sockaddr_in6 in6;
+#ifndef _WIN32
+    struct sockaddr_un un;
+#endif
 };
 
 struct part {
@@ -168,6 +172,7 @@ struct params {
     int need_free_n;
     
     const char *protect_path;
+    const char *unix_socket_path;
     bool daemonize;
     const char *pid_file;
     int pid_fd;

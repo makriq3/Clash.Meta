@@ -8,13 +8,22 @@
 #else
     #include <arpa/inet.h>
     #include <sys/socket.h>
+    #include <sys/un.h>
 #endif
 
 #include "conev.h"
 
-#define SA_SIZE(s) \
-    (((const struct sockaddr *)s)->sa_family == AF_INET6) ? \
-        sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in)
+#ifdef _WIN32
+    #define SA_SIZE(s) \
+        (((const struct sockaddr *)s)->sa_family == AF_INET6) ? \
+            sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in)
+#else
+    #define SA_SIZE(s) \
+        (((const struct sockaddr *)s)->sa_family == AF_UNIX) ? \
+            sizeof(struct sockaddr_un) : \
+            ((((const struct sockaddr *)s)->sa_family == AF_INET6) ? \
+                sizeof(struct sockaddr_in6) : sizeof(struct sockaddr_in))
+#endif
 
 #pragma pack(push, 1)
 
@@ -107,6 +116,8 @@ int on_connect(struct poolhd *pool, struct eval *val, int et);
 int on_ignore(struct poolhd *pool, struct eval *val, int etype);
 
 int start_event_loop(int srvfd);
+
+void stop_event_loop(void);
 
 int run(const union sockaddr_u *srv);
 

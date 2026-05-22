@@ -30,14 +30,24 @@ func TestParseByeByeDPIProxyFixedArgs(t *testing.T) {
 		"name":     "BBDPI",
 		"type":     "byebyedpi",
 		"strategy": "fixed",
-		"udp":      true,
 		"args":     []any{"-Ku", "-a1", "-An", "-s1"},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !proxy.SupportUDP() {
-		t.Fatal("UDP should follow config")
+	if proxy.SupportUDP() {
+		t.Fatal("UDP should stay disabled")
+	}
+}
+
+func TestParseByeByeDPIProxyRejectsUDP(t *testing.T) {
+	_, err := ParseProxy(map[string]any{
+		"name": "BBDPI",
+		"type": "byebyedpi",
+		"udp":  true,
+	})
+	if err == nil {
+		t.Fatal("expected udp=true to be rejected")
 	}
 }
 
@@ -56,7 +66,7 @@ func TestParseByeByeDPIProxyBenchmarkUsesDefaultStrategies(t *testing.T) {
 }
 
 func TestParseByeByeDPIProxyRejectsListenerArgs(t *testing.T) {
-	for _, arg := range []string{"-i127.0.0.1", "--ip=127.0.0.1", "-p1080", "--port=1080"} {
+	for _, arg := range []string{"-i127.0.0.1", "--ip=127.0.0.1", "-p1080", "--port=1080", "-z/tmp/byedpi.sock", "--unix-socket=/tmp/byedpi.sock"} {
 		_, err := ParseProxy(map[string]any{
 			"name": "BBDPI",
 			"type": "byebyedpi",

@@ -191,6 +191,7 @@ const struct option options[] = {
     #endif
     {"ipset",         1, 0, 'j'},
     {"connect-to",    1, 0, 'C'}, //
+    {"unix-socket",   1, 0, 'z'}, //
     {"comment",       1, 0, '#'}, //
     {"cache-merge",   1, 0, '/'},
     {0}
@@ -1250,6 +1251,10 @@ int parse_args(int argc, char **argv)
             if (!dp->out_type) dp->out_type = MODE_SOCKS5;
             params.delay_conn = 1;
             break;
+
+        case 'z':
+            params.unix_socket_path = optarg;
+            break;
         
         #ifdef __linux__
         case 'P':
@@ -1383,10 +1388,26 @@ int byedpi_main(int argc, char **argv)
         clear_params(cmd_line, argv);
         return status - 1;
     }
-    INIT_ADDR_STR(params.laddr);
-    LOG(LOG_S, "listen address: %s:%d\n", ADDR_STR, ntohs(params.laddr.in.sin_port));
+    #ifndef _WIN32
+    union sockaddr_u unix_laddr;
+    if (params.unix_socket_path) {
+        memset(&unix_laddr, 0, sizeof(unix_laddr));
+        unix_laddr.un.sun_family = AF_UNIX;
+        snprintf(unix_laddr.un.sun_path, sizeof(unix_laddr.un.sun_path), "%s", params.unix_socket_path);
+        LOG(LOG_S, "listen unix socket: %s\n", unix_laddr.un.sun_path);
+    }
+    else
+    #endif
+    {
+        INIT_ADDR_STR(params.laddr);
+        LOG(LOG_S, "listen address: %s:%d\n", ADDR_STR, ntohs(params.laddr.in.sin_port));
+    }
     
-    if (init() < 0 || run(&params.laddr) < 0) {
+    if (init() < 0 || run(
+        #ifndef _WIN32
+        params.unix_socket_path ? &unix_laddr :
+        #endif
+        &params.laddr) < 0) {
         clear_params(cmd_line, argv);
         return -1;
     }

@@ -14,7 +14,6 @@ proxies:
   - name: BBDPI
     type: byebyedpi
     strategy: auto
-    udp: true
     auto:
       mode: both
     strategies:

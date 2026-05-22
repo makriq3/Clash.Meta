@@ -97,13 +97,14 @@ func NewByeByeDPI(option ByeByeDPIOption) (*ByeByeDPI, error) {
 	if err := validateByeByeDPIOption(option); err != nil {
 		return nil, err
 	}
+	option.UDP = false
 	outbound := &ByeByeDPI{
 		Base: &Base{
 			name:   option.Name,
 			addr:   "local",
 			tp:     C.ByeByeDPI,
 			pdName: option.ProviderName,
-			udp:    option.UDP,
+			udp:    false,
 			tfo:    option.TFO,
 			mpTcp:  option.MPTCP,
 			iface:  option.Interface,
@@ -119,6 +120,9 @@ func NewByeByeDPI(option ByeByeDPIOption) (*ByeByeDPI, error) {
 }
 
 func validateByeByeDPIOption(option ByeByeDPIOption) error {
+	if option.UDP {
+		return errors.New("byebyedpi UDP is not supported with private socket backend")
+	}
 	switch option.Strategy {
 	case byeByeDPIStrategyAuto, byeByeDPIStrategyFixed, byeByeDPIStrategyBenchmark:
 	default:
@@ -171,7 +175,7 @@ func validateByeByeDPIArgs(args []string) error {
 			return fmt.Errorf("byebyedpi listener option %q is not allowed", arg)
 		case strings.HasPrefix(arg, "-p") && arg != "-P":
 			return fmt.Errorf("byebyedpi listener option %q is not allowed", arg)
-		case strings.HasPrefix(arg, "--ip=") || strings.HasPrefix(arg, "--port="):
+		case strings.HasPrefix(arg, "--ip=") || strings.HasPrefix(arg, "--port=") || arg == "-z" || strings.HasPrefix(arg, "-z") || arg == "--unix-socket" || strings.HasPrefix(arg, "--unix-socket="):
 			return fmt.Errorf("byebyedpi listener option %q is not allowed", arg)
 		case arg == "-P" || arg == "--protect-path" || strings.HasPrefix(arg, "-P") || strings.HasPrefix(arg, "--protect-path="):
 			return fmt.Errorf("byebyedpi protect option %q is managed by Android core", arg)
@@ -215,7 +219,7 @@ func (b *ByeByeDPI) DialContext(ctx context.Context, metadata *C.Metadata) (C.Co
 		log.Warnln("[ByeByeDPI] %s backend start failed: %v", b.Name(), err)
 		return nil, err
 	}
-	c, err := (&net.Dialer{}).DialContext(ctx, "tcp", backend.Addr())
+	c, err := (&net.Dialer{}).DialContext(ctx, backend.Network(), backend.Addr())
 	if err != nil {
 		log.Warnln("[ByeByeDPI] %s backend dial failed: %v", b.Name(), err)
 		return nil, err
@@ -225,7 +229,7 @@ func (b *ByeByeDPI) DialContext(ctx context.Context, metadata *C.Metadata) (C.Co
 			_ = c.Close()
 		}
 	}()
-	if _, err = b.socksBackend(backend.Addr()).StreamConnContext(ctx, c, metadata); err != nil {
+	if _, err = b.socksBackend(backend.Network(), backend.Addr()).StreamConnContext(ctx, c, metadata); err != nil {
 		log.Warnln("[ByeByeDPI] %s SOCKS relay failed: %v", b.Name(), err)
 		return nil, err
 	}
@@ -302,7 +306,7 @@ func (b *ByeByeDPI) checkSite(ctx context.Context, site string, args []string, t
 			if err != nil {
 				return nil, err
 			}
-			c, err := (&net.Dialer{}).DialContext(ctx, "tcp", backend.Addr())
+			c, err := (&net.Dialer{}).DialContext(ctx, backend.Network(), backend.Addr())
 			if err != nil {
 				_ = backend.Close()
 				return nil, err
@@ -315,7 +319,7 @@ func (b *ByeByeDPI) checkSite(ctx context.Context, site string, args []string, t
 			}
 			p, _ := strconv.Atoi(port)
 			metadata := &C.Metadata{Host: host, DstPort: uint16(p)}
-			if _, err = b.socksBackend(backend.Addr()).StreamConnContext(ctx, c, metadata); err != nil {
+			if _, err = b.socksBackend(backend.Network(), backend.Addr()).StreamConnContext(ctx, c, metadata); err != nil {
 				_ = backend.Close()
 				_ = c.Close()
 				return nil, err
@@ -343,17 +347,7 @@ func (b *ByeByeDPI) checkSite(ctx context.Context, site string, args []string, t
 }
 
 func (b *ByeByeDPI) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
-	if !b.SupportUDP() {
-		return nil, C.ErrNotSupport
-	}
-	if err := b.loopBack.CheckPacketConn(metadata); err != nil {
-		return nil, err
-	}
-	backend, err := b.ensureBackend()
-	if err != nil {
-		return nil, err
-	}
-	return b.socksBackend(backend.Addr()).ListenPacketContext(ctx, metadata)
+	return nil, C.ErrNotSupport
 }
 
 func (b *ByeByeDPI) IsL3Protocol(metadata *C.Metadata) bool {
@@ -371,7 +365,7 @@ func (b *ByeByeDPI) MarshalJSON() ([]byte, error) {
 		"type":     b.Type().String(),
 		"id":       b.Id(),
 		"strategy": b.option.Strategy,
-		"udp":      b.option.UDP,
+		"udp":      false,
 	})
 }
 
@@ -390,7 +384,7 @@ func (b *ByeByeDPI) ensureBackend() (*byedpi.Instance, error) {
 	return backend, nil
 }
 
-func (b *ByeByeDPI) socksBackend(addr string) *Socks5 {
+func (b *ByeByeDPI) socksBackend(network string, addr string) *Socks5 {
 	return &Socks5{
 		Base: &Base{
 			name:   b.Name(),
@@ -398,9 +392,9 @@ func (b *ByeByeDPI) socksBackend(addr string) *Socks5 {
 			tp:     C.ByeByeDPI,
 			pdName: b.ProxyInfo().ProviderName,
 			udp:    b.option.UDP,
-			dialer: localByeByeDPIDialer{},
+			dialer: localByeByeDPIDialer{network: network},
 		},
-		option: &Socks5Option{Name: b.Name(), Server: "127.0.0.1", UDP: b.option.UDP},
+		option: &Socks5Option{Name: b.Name(), Server: "127.0.0.1", UDP: false},
 	}
 }
 
@@ -430,9 +424,14 @@ func (c closeWithBackendConn) Close() error {
 	return err
 }
 
-type localByeByeDPIDialer struct{}
+type localByeByeDPIDialer struct {
+	network string
+}
 
-func (localByeByeDPIDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+func (d localByeByeDPIDialer) DialContext(ctx context.Context, network, address string) (net.Conn, error) {
+	if d.network != "" {
+		network = d.network
+	}
 	return (&net.Dialer{}).DialContext(ctx, network, address)
 }
 

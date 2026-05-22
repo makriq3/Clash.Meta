@@ -18,6 +18,7 @@ package byedpi
 
 extern int server_fd;
 int byedpi_main(int argc, char **argv);
+void stop_event_loop(void);
 void clear_params(char *line, char **argv);
 
 static struct params default_params_go = {
@@ -50,18 +51,20 @@ static int byedpi_start(int argc, char **argv) {
 
 static void byedpi_stop(void) {
 	if (server_fd >= 0) {
-		shutdown(server_fd, SHUT_RDWR);
-		close(server_fd);
-		server_fd = -1;
+		stop_event_loop();
 	}
 }
 */
 import "C"
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -70,6 +73,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
 )
 
@@ -83,13 +87,15 @@ type Instance struct {
 }
 
 type sharedBackend struct {
-	key      string
-	addr     string
-	done     chan int
-	refs     int
-	stopOnce sync.Once
-	stopped  atomic.Bool
-	exitCode atomic.Int32
+	key        string
+	network    string
+	addr       string
+	socketPath string
+	done       chan int
+	refs       int
+	stopOnce   sync.Once
+	stopped    atomic.Bool
+	exitCode   atomic.Int32
 }
 
 func Start(args []string) (*Instance, error) {
@@ -97,11 +103,16 @@ func Start(args []string) (*Instance, error) {
 	if protectPath == "" && runtime.GOOS == "android" {
 		return nil, errors.New("byedpi protect path is not configured")
 	}
-	key := buildBackendKey(protectPath, args)
+	socketPath, err := buildSocketPath(protectPath, args)
+	if err != nil {
+		return nil, err
+	}
+	key := buildBackendKey(protectPath, socketPath, args)
 
 	runMu.Lock()
 	for {
 		if current != nil && current.stopped.Load() {
+			current.cleanup()
 			current = nil
 		}
 		if current == nil {
@@ -118,27 +129,26 @@ func Start(args []string) (*Instance, error) {
 		current = nil
 		runMu.Unlock()
 		previous.stop()
-		previous.waitStopped(2 * time.Second)
+		_ = previous.waitStopped(2 * time.Second)
 		if !previous.stopped.Load() {
 			runMu.Lock()
 			current = previous
 			runMu.Unlock()
 			return nil, errors.New("previous byedpi backend did not stop")
 		}
+		previous.cleanup()
 		runMu.Lock()
 	}
 
-	port, err := reservePort()
-	if err != nil {
-		runMu.Unlock()
-		return nil, err
-	}
-	fullArgs := []string{"ciadpi", "--ip", "127.0.0.1", "--port", strconv.Itoa(port)}
+	// The embedded SOCKS backend is intentionally bound to an app-private Unix
+	// socket so Android apps cannot discover or abuse a localhost TCP listener.
+	_ = os.Remove(socketPath)
+	fullArgs := []string{"ciadpi", "--unix-socket", socketPath}
 	if protectPath != "" {
 		fullArgs = append(fullArgs, "--protect-path", protectPath)
 	}
 	fullArgs = append(fullArgs, args...)
-	log.Infoln("[ByeByeDPI] starting native backend at %s, protect=%v, args=%d", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), protectPath != "", len(args))
+	log.Infoln("[ByeByeDPI] starting native backend at unix://%s, protect=%v, args=%d", socketPath, protectPath != "", len(args))
 
 	argc := C.int(len(fullArgs))
 	argv := make([]*C.char, len(fullArgs))
@@ -148,10 +158,12 @@ func Start(args []string) (*Instance, error) {
 	argv = append(argv, nil)
 	done := make(chan int, 1)
 	backend := &sharedBackend{
-		key:  key,
-		addr: net.JoinHostPort("127.0.0.1", strconv.Itoa(port)),
-		done: done,
-		refs: 1,
+		key:        key,
+		network:    "unix",
+		addr:       socketPath,
+		socketPath: socketPath,
+		done:       done,
+		refs:       1,
 	}
 	current = backend
 	runMu.Unlock()
@@ -173,7 +185,8 @@ func Start(args []string) (*Instance, error) {
 	inst := &Instance{backend: backend}
 	if err := inst.waitReady(2 * time.Second); err != nil {
 		backend.stop()
-		backend.waitStopped(2 * time.Second)
+		_ = backend.waitStopped(2 * time.Second)
+		backend.cleanup()
 		runMu.Lock()
 		if current == backend {
 			current = nil
@@ -182,8 +195,15 @@ func Start(args []string) (*Instance, error) {
 		log.Warnln("[ByeByeDPI] native backend did not become ready: %v", err)
 		return nil, err
 	}
-	log.Infoln("[ByeByeDPI] native backend ready at %s", backend.addr)
+	log.Infoln("[ByeByeDPI] native backend ready at unix://%s", backend.addr)
 	return inst, nil
+}
+
+func (i *Instance) Network() string {
+	if i == nil || i.backend == nil {
+		return ""
+	}
+	return i.backend.network
 }
 
 func (i *Instance) Addr() string {
@@ -201,18 +221,40 @@ func (i *Instance) Close() error {
 	if i.backend.refs > 0 {
 		i.backend.refs--
 	}
+	backend := i.backend
+	shouldStop := backend.refs == 0 && current == backend
+	if shouldStop {
+		current = nil
+	}
 	runMu.Unlock()
 	i.backend = nil
+	if shouldStop {
+		backend.stop()
+		if !backend.waitStopped(2 * time.Second) {
+			return errors.New("byedpi backend did not stop")
+		}
+		backend.cleanup()
+	}
 	return nil
 }
 
-func reservePort() (int, error) {
-	l, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		return 0, err
+func buildSocketPath(protectPath string, args []string) (string, error) {
+	homeDir := constant.Path.HomeDir()
+	if homeDir == "" {
+		homeDir = os.TempDir()
 	}
-	defer l.Close()
-	return l.Addr().(*net.TCPAddr).Port, nil
+	dir := filepath.Join(homeDir, "run")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256([]byte(buildConfigKey(protectPath, args)))
+	name := "byedpi-" + hex.EncodeToString(sum[:8]) + ".sock"
+	path := filepath.Join(dir, name)
+	const unixSocketPathLimit = 100
+	if len(path) >= unixSocketPathLimit {
+		return "", fmt.Errorf("byedpi unix socket path is too long: length=%d limit=%d path=%q", len(path), unixSocketPathLimit-1, path)
+	}
+	return path, nil
 }
 
 func (i *Instance) waitReady(timeout time.Duration) error {
@@ -222,7 +264,7 @@ func (i *Instance) waitReady(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	var lastErr error
 	for time.Now().Before(deadline) {
-		conn, err := net.DialTimeout("tcp4", i.backend.addr, 100*time.Millisecond)
+		conn, err := net.DialTimeout(i.backend.network, i.backend.addr, 100*time.Millisecond)
 		if err == nil {
 			_ = conn.Close()
 			return nil
@@ -240,9 +282,16 @@ func (i *Instance) waitReady(timeout time.Duration) error {
 	return errors.New("byedpi backend did not start")
 }
 
-func buildBackendKey(protectPath string, args []string) string {
+func buildConfigKey(protectPath string, args []string) string {
 	parts := make([]string, 0, len(args)+1)
 	parts = append(parts, protectPath)
+	parts = append(parts, args...)
+	return strings.Join(parts, "\x00")
+}
+
+func buildBackendKey(protectPath string, socketPath string, args []string) string {
+	parts := make([]string, 0, len(args)+2)
+	parts = append(parts, protectPath, socketPath)
 	parts = append(parts, args...)
 	return strings.Join(parts, "\x00")
 }
@@ -256,12 +305,20 @@ func (b *sharedBackend) stop() {
 	})
 }
 
-func (b *sharedBackend) waitStopped(timeout time.Duration) {
+func (b *sharedBackend) cleanup() {
+	if b != nil && b.socketPath != "" {
+		_ = os.Remove(b.socketPath)
+	}
+}
+
+func (b *sharedBackend) waitStopped(timeout time.Duration) bool {
 	if b == nil {
-		return
+		return true
 	}
 	select {
 	case <-b.done:
+		return true
 	case <-time.After(timeout):
+		return false
 	}
 }

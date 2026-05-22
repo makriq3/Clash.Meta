@@ -27,6 +27,7 @@
     #include <fcntl.h>
     
     #include <sys/socket.h>
+    #include <sys/un.h>
     #include <arpa/inet.h>
     #include <netinet/tcp.h>
     #include <netdb.h>
@@ -45,6 +46,7 @@
 
 
 int server_fd;
+static struct poolhd *server_pool;
 
 static void on_cancel(int sig) {
     shutdown(server_fd, SHUT_RDWR);
@@ -638,12 +640,14 @@ static int on_accept(struct poolhd *pool, struct eval *val, int et)
             continue;
         }
         #endif
-        int one = 1;
-        if (setsockopt(c, IPPROTO_TCP, TCP_NODELAY,
-                (char *)&one, sizeof(one))) {
-            uniperror("setsockopt TCP_NODELAY");
-            close(c);
-            continue;
+        if (client.sa.sa_family != AF_UNIX) {
+            int one = 1;
+            if (setsockopt(c, IPPROTO_TCP, TCP_NODELAY,
+                    (char *)&one, sizeof(one))) {
+                uniperror("setsockopt TCP_NODELAY");
+                close(c);
+                continue;
+            }
         }
         if (!(rval = add_event(pool, &on_request, c, POLLIN))) {
             close(c);
@@ -1028,11 +1032,37 @@ int start_event_loop(int srvfd)
         close(srvfd);
         return -1;
     }
+    server_pool = pool;
     loop_event(pool);
     
     LOG(LOG_S, "exit\n");
     destroy_pool(pool);
+    server_pool = 0;
+    server_fd = -1;
     return 0;
+}
+
+void stop_event_loop(void)
+{
+    if (server_pool) {
+        server_pool->brk = 1;
+    }
+    if (server_fd >= 0) {
+#ifndef _WIN32
+        if (params.unix_socket_path) {
+            struct sockaddr_un sa;
+            memset(&sa, 0, sizeof(sa));
+            sa.sun_family = AF_UNIX;
+            snprintf(sa.sun_path, sizeof(sa.sun_path), "%s", params.unix_socket_path);
+            int wake_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+            if (wake_fd >= 0) {
+                connect(wake_fd, (struct sockaddr *)&sa, sizeof(sa));
+                close(wake_fd);
+            }
+        }
+#endif
+        shutdown(server_fd, SHUT_RDWR);
+    }
 }
 
 
@@ -1043,8 +1073,13 @@ int listen_socket(const union sockaddr_u *srv)
         uniperror("socket");  
         return -1;  
     }
+#ifndef _WIN32
+    if (srv->sa.sa_family == AF_UNIX) {
+        unlink(srv->un.sun_path);
+    }
+#endif
     int opt = 1;
-    if (setsockopt(srvfd, SOL_SOCKET, 
+    if (srv->sa.sa_family != AF_UNIX && setsockopt(srvfd, SOL_SOCKET,
             SO_REUSEADDR, (char *)&opt, sizeof(opt)) == -1) {
         uniperror("setsockopt");
         close(srvfd);
